@@ -2,7 +2,7 @@
   "mcpServers": {
     "conversation-search": {
       "command": "uv",
-      "args": ["run", "/home/gbr/work/ai/cross-session-memory/conversation_search.py", "*"]
+      "args": ["run", "/home/gbr/work/ai/cross-session-memory/conversation_search.py", "--pattern", "*"]
     }
   }
 }

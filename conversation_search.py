@@ -683,10 +683,9 @@ def main() -> None:
         description="MCP server for searching Claude Code conversation transcripts"
     )
     parser.add_argument(
-        "pattern",
-        nargs="?",
-        default="-home-gbr-work-001-sites*",
-        help="Glob pattern for project directories under ~/.claude/projects/",
+        "--pattern",
+        required=True,
+        help="Glob pattern for project directories under ~/.claude/projects/ (e.g. '*' for all, '-home-gbr-work-*' for a subtree)",
     )
     args = parser.parse_args()
     _pattern = args.pattern

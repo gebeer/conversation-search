@@ -4,6 +4,14 @@ MCP server that provides BM25 keyword search over Claude Code conversation histo
 
 Based on [Searchable Agent Memory in a Single File](https://eric-tramel.github.io/blog/2026-02-07-searchable-agent-memory/) by Eric Tramel.
 
+## Development process
+
+The implementation was produced by Claude Code following a structured pipeline:
+
+1. **PRD** (`ai-docs/features/001-conversation-search-mcp.md`) — requirements and design decisions
+2. **Build spec** (`specs/conversation-search-mcp.md`) — generated from the PRD, containing exact function signatures, filtering rules, acceptance criteria, and validation commands
+3. **Implementation** (`conversation_search.py`) — written by Claude Code using the build spec as instructions
+
 ## How it works
 
 Claude Code stores conversation transcripts as JSONL files under `~/.claude/projects/<encoded-dir>/`. This server:
@@ -30,21 +38,19 @@ Add to `.mcp.json` (project-level or `~/.claude/.mcp.json` for global):
   "mcpServers": {
     "conversation-search": {
       "command": "uv",
-      "args": ["run", "/absolute/path/to/conversation_search.py", "<pattern>"]
+      "args": ["run", "/absolute/path/to/conversation_search.py", "--pattern", "<pattern>"]
     }
   }
 }
 ```
 
-The `<pattern>` argument is a glob matched against directory names under `~/.claude/projects/`. Examples:
+The `--pattern` flag is **required**. It's a glob matched against directory names under `~/.claude/projects/`. Examples:
 
 | Pattern | Scope |
 |---------|-------|
 | `*` | All projects |
 | `-home-gbr-work-001-sites*` | All sites projects |
 | `-home-gbr-work-ai-*` | All AI projects |
-
-Default (no argument): `-home-gbr-work-001-sites*`
 
 Restart Claude Code after editing `.mcp.json`.
 
