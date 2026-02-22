@@ -804,6 +804,19 @@ def _write_daemon_files(pid: int, port: int) -> None:
     (cache / "daemon.port").write_text(str(port))
 
 
+def _try_daemon_query(command: str, params: dict) -> dict | None:
+    """Try to forward a CLI query to the running daemon.
+
+    Returns None always — CLI-via-daemon forwarding is deferred to v2.
+    The daemon exposes MCP tools over SSE/JSON-RPC; implementing a full
+    JSON-RPC client here would duplicate the connect bridge complexity
+    for marginal benefit (CLI queries are one-shots where local index
+    build time is acceptable). The real win is for persistent MCP sessions
+    via `connect`, not CLI usage.
+    """
+    return None
+
+
 def _run_daemon(port: int = _DEFAULT_PORT, idle_timeout: float = _DEFAULT_IDLE_TIMEOUT) -> None:
     """Start the SSE daemon process.
 
