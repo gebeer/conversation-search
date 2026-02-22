@@ -862,6 +862,8 @@ def _run_daemon(port: int = _DEFAULT_PORT, idle_timeout: float = _DEFAULT_IDLE_T
                     file=sys.stderr,
                 )
                 _cleanup_daemon_files()
+                # os._exit is required: sys.exit() from a non-main thread only
+                # raises SystemExit in that thread, leaving the daemon alive.
                 os._exit(0)
 
     idle_thread = threading.Thread(target=idle_watcher, daemon=True)
@@ -875,7 +877,10 @@ def _run_daemon(port: int = _DEFAULT_PORT, idle_timeout: float = _DEFAULT_IDLE_T
         port=port,
     )
 
-    # Register tools with activity tracking
+    # Register tools with activity tracking.
+    # These are re-registered here (not via _register_tools) because each tool
+    # must call touch_activity(). _register_tools does not take a callback
+    # parameter — adding one would complicate the simpler stdio path for no gain.
     @daemon_server.tool()
     def search_conversations(
         query: str,
@@ -932,15 +937,24 @@ def _run_daemon(port: int = _DEFAULT_PORT, idle_timeout: float = _DEFAULT_IDLE_T
         touch_activity()
         return json.dumps(index.read_conversation(session_id, offset, limit))
 
-    # Write PID/port files and register cleanup
+    # Write PID/port before starting uvicorn. There is a short window between
+    # this write and the port actually being bound (~1s). A concurrent `connect`
+    # checking _is_daemon_healthy() in this window will get False and may attempt
+    # to start a second daemon, which will fail on port bind. This is acceptable —
+    # the second attempt will retry and find the healthy daemon.
     _write_daemon_files(os.getpid(), port)
 
     def _shutdown(signum: int, frame: object) -> None:
         print(f"[conversation-search] daemon shutting down (signal {signum})", file=sys.stderr)
         _cleanup_daemon_files()
-        observer.stop()
+        # os._exit terminates all threads immediately (including the observer).
+        # observer.stop() is omitted — it would be a no-op before os._exit.
         os._exit(0)
 
+    # Register cleanup handlers. Note: uvicorn's serve() will override SIGTERM/SIGINT
+    # with its own graceful-shutdown handler, which saves our handlers first and
+    # re-raises after uvicorn teardown completes. _shutdown therefore runs after
+    # uvicorn has already shut down HTTP — observer.stop() and os._exit(0) are safe.
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
 
