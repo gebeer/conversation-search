@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import fnmatch
 import json
+import os
 import re
 import sys
 import threading
@@ -727,6 +728,74 @@ class _DirDiscoveryHandler(FileSystemEventHandler):
     def on_created(self, event):  # type: ignore[override]
         if event.is_directory:
             self._schedule_check(event.src_path)
+
+
+# ---------------------------------------------------------------------------
+# Daemon helpers
+# ---------------------------------------------------------------------------
+
+_DAEMON_CACHE_DIR = Path.home() / ".cache" / "conversation-search"
+_DEFAULT_PORT = 9237
+_DEFAULT_IDLE_TIMEOUT = 900  # 15 minutes
+
+
+def _daemon_cache_dir() -> Path:
+    """Return the cache dir, creating it if needed."""
+    _DAEMON_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    return _DAEMON_CACHE_DIR
+
+
+def _read_daemon_state() -> tuple[int, int] | None:
+    """Read (pid, port) from cache files. Returns None if files missing or malformed."""
+    cache = _DAEMON_CACHE_DIR
+    pid_file = cache / "daemon.pid"
+    port_file = cache / "daemon.port"
+    try:
+        pid = int(pid_file.read_text().strip())
+        port = int(port_file.read_text().strip())
+        return pid, port
+    except (FileNotFoundError, ValueError):
+        return None
+
+
+def _is_pid_alive(pid: int) -> bool:
+    """Return True if process with given PID exists."""
+    try:
+        os.kill(pid, 0)
+        return True
+    except (OSError, ProcessLookupError):
+        return False
+
+
+def _is_port_responding(port: int) -> bool:
+    """Return True if something is listening on localhost:port."""
+    import socket
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=1):
+            return True
+    except OSError:
+        return False
+
+
+def _is_daemon_healthy(pid: int, port: int) -> bool:
+    """Return True if daemon PID is alive and port is responding."""
+    return _is_pid_alive(pid) and _is_port_responding(port)
+
+
+def _cleanup_daemon_files() -> None:
+    """Remove PID and port files from cache dir."""
+    for name in ("daemon.pid", "daemon.port"):
+        try:
+            (_DAEMON_CACHE_DIR / name).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _write_daemon_files(pid: int, port: int) -> None:
+    """Write PID and port to cache dir."""
+    cache = _daemon_cache_dir()
+    (cache / "daemon.pid").write_text(str(pid))
+    (cache / "daemon.port").write_text(str(port))
 
 
 def _register_tools(server: FastMCP, index: ConversationIndex) -> None:
