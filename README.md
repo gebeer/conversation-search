@@ -74,6 +74,65 @@ uv run conversation_search.py read-conv --session-id "<uuid>" --offset 0 --limit
 
 All CLI commands output pretty-printed JSON to stdout. Index progress is printed to stderr. Use `2>/dev/null` to suppress progress output when piping.
 
+## Daemon Mode (Recommended for Multiple Sessions)
+
+When running multiple Claude Code sessions simultaneously, use daemon mode to share a single
+BM25 index instead of building one per session.
+
+### Setup
+
+Update your MCP config to use the `connect` subcommand:
+
+```json
+{
+  "mcpServers": {
+    "conversation-search": {
+      "command": "uv",
+      "args": ["run", "/path/to/conversation_search.py", "connect"]
+    }
+  }
+}
+```
+
+That's it. On first session start, `connect` automatically launches the daemon in the background.
+Subsequent sessions reuse it. The daemon exits after 15 minutes of inactivity.
+
+### Manual daemon control
+
+```bash
+# Start daemon in foreground (useful for debugging)
+uv run conversation_search.py daemon
+
+# Custom port and idle timeout
+uv run conversation_search.py daemon --port 9300 --idle-timeout 1800
+
+# Stop daemon
+kill $(cat ~/.cache/conversation-search/daemon.pid)
+```
+
+### Configuration
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--port` | 9237 | Localhost port for the SSE server |
+| `--idle-timeout` | 900 | Seconds of inactivity before daemon exits |
+
+Both flags work on `daemon` and `connect` subcommands.
+
+### How it works
+
+```
+Claude Code session A ──┐
+Claude Code session B ──┼── connect (stdio↔SSE bridge) ──► daemon (SSE on localhost:9237)
+Claude Code session C ──┘                                       │
+                                                          • one BM25 index (~225 MB)
+                                                          • one inotify watcher set
+                                                          • one reindex loop
+```
+
+**Without daemon:** N sessions × ~225 MB RAM, N reindex cycles per file change.
+**With daemon:** 1 × ~225 MB regardless of session count.
+
 ## Tools
 
 ### `search_conversations`
