@@ -1020,7 +1020,7 @@ def _run_connect(port: int = _DEFAULT_PORT, idle_timeout: float = _DEFAULT_IDLE_
 
     async def _bridge() -> None:
         async with stdio_server() as (stdio_read, stdio_write):
-            async with sse_client(sse_url) as (sse_read, sse_write):
+            async with sse_client(sse_url, sse_read_timeout=idle_timeout + 60) as (sse_read, sse_write):
                 async with anyio.create_task_group() as tg:
                     async def forward_to_daemon() -> None:
                         async for message in stdio_read:
