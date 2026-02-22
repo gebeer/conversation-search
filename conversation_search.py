@@ -730,7 +730,13 @@ class _DirDiscoveryHandler(FileSystemEventHandler):
 
 
 def _register_tools(server: FastMCP, index: ConversationIndex) -> None:
-    """Register the four MCP tools on the given FastMCP server instance."""
+    """Register the four MCP search tools on *server*, closing over *index*.
+
+    Parameterised so the same tool set can be wired to distinct FastMCP
+    instances (e.g. the stdio server and a daemon SSE server) each backed
+    by its own ConversationIndex. Call once per server instance, before
+    server.run().
+    """
 
     @server.tool()
     def search_conversations(
