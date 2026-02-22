@@ -961,6 +961,12 @@ def _run_daemon(port: int = _DEFAULT_PORT, idle_timeout: float = _DEFAULT_IDLE_T
     import atexit
     atexit.register(_cleanup_daemon_files)
 
+    @daemon_server.custom_route("/health", methods=["GET"])
+    async def health_check(request: object) -> object:
+        from starlette.responses import JSONResponse
+
+        return JSONResponse({"status": "ok"})
+
     print(f"[conversation-search] daemon starting on http://127.0.0.1:{port}", file=sys.stderr)
     daemon_server.run(transport="sse")
 
