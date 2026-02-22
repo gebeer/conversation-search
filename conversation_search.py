@@ -804,19 +804,6 @@ def _write_daemon_files(pid: int, port: int) -> None:
     (cache / "daemon.port").write_text(str(port))
 
 
-def _try_daemon_query(command: str, params: dict) -> dict | None:
-    """Try to forward a CLI query to the running daemon.
-
-    Returns None always — CLI-via-daemon forwarding is deferred to v2.
-    The daemon exposes MCP tools over SSE/JSON-RPC; implementing a full
-    JSON-RPC client here would duplicate the connect bridge complexity
-    for marginal benefit (CLI queries are one-shots where local index
-    build time is acceptable). The real win is for persistent MCP sessions
-    via `connect`, not CLI usage.
-    """
-    return None
-
-
 def _run_daemon(port: int = _DEFAULT_PORT, idle_timeout: float = _DEFAULT_IDLE_TIMEOUT) -> None:
     """Start the SSE daemon process.
 
@@ -1221,6 +1208,10 @@ def main() -> None:
     elif args.command == "connect":
         _run_connect(port=args.port, idle_timeout=args.idle_timeout)
     else:
+        # CLI subcommands build a local index directly. Forwarding queries to a
+        # running daemon (to reuse its warm index) is deferred to v2 — it would
+        # require a full JSON-RPC client against the SSE server, duplicating the
+        # connect bridge for marginal benefit on one-shot CLI queries.
         index = ConversationIndex()
         index.build(args.pattern)
 
