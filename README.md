@@ -1,6 +1,6 @@
 # conversation-search
 
-MCP server that provides BM25 keyword search over Claude Code conversation history. Indexes JSONL transcripts from `~/.claude/projects/` and exposes them as searchable memory across sessions.
+BM25 keyword search over Claude Code conversation history. Indexes JSONL transcripts from `~/.claude/projects/` and exposes them as searchable memory. Available as both an MCP server and a CLI tool.
 
 Based on [Searchable Agent Memory in a Single File](https://eric-tramel.github.io/blog/2026-02-07-searchable-agent-memory/) by Eric Tramel.
 
@@ -19,32 +19,32 @@ Claude Code stores conversation transcripts as JSONL files under `~/.claude/proj
 1. Discovers matching project directories via glob pattern
 2. Parses JSONL into turns (user message + assistant response + tool calls)
 3. Builds a BM25 index over the corpus
-4. Watches the filesystem for changes and reindexes with 2s debounce
-5. Serves 4 MCP tools over stdio
+4. Watches the filesystem for changes and reindexes (60s debounce)
+5. Serves 4 MCP tools via stdio (`serve`) or SSE (`daemon`)
 
 ## Requirements
 
 - Python >= 3.10
 - [`uv`](https://docs.astral.sh/uv/) (dependencies are managed via PEP 723 inline metadata)
 
-No venv or manual install needed. `uv run` handles `bm25s`, `mcp`, and `watchdog` automatically.
+No venv or manual install needed. `uv run` handles `bm25s`, `mcp`, `uvicorn`, and `watchdog` automatically.
 
 ## Configuration
 
-Add to `.mcp.json` (project-level or `~/.claude/.mcp.json` for global):
+Add to your MCP configuration — either project-level (`.mcp.json`) or global (`~/.claude.json` under the `mcpServers` key):
 
 ```json
 {
   "mcpServers": {
     "conversation-search": {
       "command": "uv",
-      "args": ["run", "/absolute/path/to/conversation_search.py", "--pattern", "<pattern>"]
+      "args": ["run", "/absolute/path/to/conversation_search.py", "serve", "--pattern", "<pattern>"]
     }
   }
 }
 ```
 
-The `--pattern` flag is **required**. It's a glob matched against directory names under `~/.claude/projects/`. Examples:
+The `--pattern` flag controls which project directories under `~/.claude/projects/` are indexed. It defaults to `*` (all projects) if omitted. Examples:
 
 | Pattern | Scope |
 |---------|-------|
@@ -52,7 +52,86 @@ The `--pattern` flag is **required**. It's a glob matched against directory name
 | `-home-gbr-work-001-sites*` | All sites projects |
 | `-home-gbr-work-ai-*` | All AI projects |
 
-Restart Claude Code after editing `.mcp.json`.
+Restart Claude Code after changing MCP configuration.
+
+## CLI Usage
+
+The tool can also be used directly from the command line for scripting and debugging:
+
+```bash
+# Search conversations (--pattern defaults to '*')
+uv run conversation_search.py search --query "heartbeat" --limit 5
+
+# List conversations
+uv run conversation_search.py list --project "claude" --limit 10
+
+# Read a specific turn (full fidelity)
+uv run conversation_search.py read-turn --session-id "<uuid>" --turn 5
+
+# Read consecutive turns
+uv run conversation_search.py read-conv --session-id "<uuid>" --offset 0 --limit 10
+```
+
+All CLI commands output pretty-printed JSON to stdout. Index progress is printed to stderr. Use `2>/dev/null` to suppress progress output when piping.
+
+## Daemon Mode (Recommended for Multiple Sessions)
+
+When running multiple Claude Code sessions simultaneously, use daemon mode to share a single
+BM25 index instead of building one per session.
+
+### Setup
+
+Update your MCP config to use the `connect` subcommand:
+
+```json
+{
+  "mcpServers": {
+    "conversation-search": {
+      "command": "uv",
+      "args": ["run", "/path/to/conversation_search.py", "connect"]
+    }
+  }
+}
+```
+
+That's it. On first session start, `connect` automatically launches the daemon in the background.
+Subsequent sessions reuse it. The daemon exits after 15 minutes of inactivity.
+
+### Manual daemon control
+
+```bash
+# Start daemon in foreground (useful for debugging)
+uv run conversation_search.py daemon
+
+# Custom port and idle timeout
+uv run conversation_search.py daemon --port 9300 --idle-timeout 1800
+
+# Stop daemon
+kill $(cat ~/.cache/conversation-search/daemon.pid)
+```
+
+### Configuration
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--port` | 9237 | Localhost port for the SSE server |
+| `--idle-timeout` | 900 | Seconds of inactivity before daemon exits |
+
+Both flags work on `daemon` and `connect` subcommands.
+
+### How it works
+
+```
+Claude Code session A ──┐
+Claude Code session B ──┼── connect (stdio↔SSE bridge) ──► daemon (SSE on localhost:9237)
+Claude Code session C ──┘                                       │
+                                                          • one BM25 index (~250 MB)
+                                                          • one inotify watcher set
+                                                          • one reindex loop
+```
+
+**Without daemon:** N sessions × ~250 MB RAM, N reindex cycles per file change.
+**With daemon:** 1 × ~250 MB regardless of session count.
 
 ## Tools
 
