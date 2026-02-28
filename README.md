@@ -4,13 +4,6 @@ BM25 keyword search over Claude Code conversation history. Indexes JSONL transcr
 
 Based on [Searchable Agent Memory in a Single File](https://eric-tramel.github.io/blog/2026-02-07-searchable-agent-memory/) by Eric Tramel.
 
-## Development process
-
-The implementation was produced by Claude Code following a structured pipeline:
-
-1. **PRD** (`ai-docs/features/001-conversation-search-mcp.md`) — requirements and design decisions
-2. **Build spec** (`specs/conversation-search-mcp.md`) — generated from the PRD, containing exact function signatures, filtering rules, acceptance criteria, and validation commands
-3. **Implementation** (`conversation_search.py`) — written by Claude Code using the build spec as instructions
 
 ## How it works
 
@@ -24,12 +17,11 @@ Claude Code stores conversation transcripts as JSONL files under `~/.claude/proj
 
 ## Requirements
 
-- Python >= 3.10
-- [`uv`](https://docs.astral.sh/uv/) (dependencies are managed via PEP 723 inline metadata)
+- [`uv`](https://docs.astral.sh/uv/) (Python >= 3.10 is resolved automatically)
 
-No venv or manual install needed. `uv run` handles `bm25s`, `mcp`, `uvicorn`, and `watchdog` automatically.
+No venv or manual install needed.
 
-## Configuration
+## Installation
 
 Add to your MCP configuration — either project-level (`.mcp.json`) or global (`~/.claude.json` under the `mcpServers` key):
 
@@ -37,20 +29,17 @@ Add to your MCP configuration — either project-level (`.mcp.json`) or global (
 {
   "mcpServers": {
     "conversation-search": {
-      "command": "uv",
-      "args": ["run", "/absolute/path/to/conversation_search.py", "serve", "--pattern", "<pattern>"]
+      "command": "uvx",
+      "args": [
+        "--from", "git+https://github.com/gebeer/conversation-search.git",
+        "conversation-search", "connect"
+      ]
     }
   }
 }
 ```
 
-The `--pattern` flag controls which project directories under `~/.claude/projects/` are indexed. It defaults to `*` (all projects) if omitted. Examples:
-
-| Pattern | Scope |
-|---------|-------|
-| `*` | All projects |
-| `-home-gbr-work-001-sites*` | All sites projects |
-| `-home-gbr-work-ai-*` | All AI projects |
+`connect` starts a shared daemon on first use and reuses it across sessions (see [Daemon Mode](#daemon-mode-recommended-for-multiple-sessions)). For standalone stdio mode (one index per session), replace `connect` with `serve`.
 
 Restart Claude Code after changing MCP configuration.
 
@@ -59,18 +48,17 @@ Restart Claude Code after changing MCP configuration.
 The tool can also be used directly from the command line for scripting and debugging:
 
 ```bash
-# Search conversations (--pattern defaults to '*')
-uv run conversation_search.py search --query "heartbeat" --limit 5
+uvx --from git+https://github.com/gebeer/conversation-search.git \
+  conversation-search search --query "heartbeat" --limit 5
 
-# List conversations
-uv run conversation_search.py list --project "claude" --limit 10
+conversation-search list --project "claude" --limit 10
 
-# Read a specific turn (full fidelity)
-uv run conversation_search.py read-turn --session-id "<uuid>" --turn 5
+conversation-search read-turn --session-id "<uuid>" --turn 5
 
-# Read consecutive turns
-uv run conversation_search.py read-conv --session-id "<uuid>" --offset 0 --limit 10
+conversation-search read-conv --session-id "<uuid>" --offset 0 --limit 10
 ```
+
+After the first `uvx` invocation, the `conversation-search` command is cached and can be called directly. Alternatively, use `uv run conversation_search.py <command>` from a local clone.
 
 All CLI commands output pretty-printed JSON to stdout. Index progress is printed to stderr. Use `2>/dev/null` to suppress progress output when piping.
 
@@ -81,30 +69,16 @@ BM25 index instead of building one per session.
 
 ### Setup
 
-Update your MCP config to use the `connect` subcommand:
-
-```json
-{
-  "mcpServers": {
-    "conversation-search": {
-      "command": "uv",
-      "args": ["run", "/path/to/conversation_search.py", "connect"]
-    }
-  }
-}
-```
-
-That's it. On first session start, `connect` automatically launches the daemon in the background.
-Subsequent sessions reuse it. The daemon exits after 15 minutes of inactivity.
+The default [installation](#installation) config already uses `connect`, which enables daemon mode automatically. On first session start, `connect` launches the daemon in the background. Subsequent sessions reuse it. The daemon exits after 15 minutes of inactivity.
 
 ### Manual daemon control
 
 ```bash
 # Start daemon in foreground (useful for debugging)
-uv run conversation_search.py daemon
+conversation-search daemon
 
 # Custom port and idle timeout
-uv run conversation_search.py daemon --port 9300 --idle-timeout 1800
+conversation-search daemon --port 9300 --idle-timeout 1800
 
 # Stop daemon
 kill $(cat ~/.cache/conversation-search/daemon.pid)

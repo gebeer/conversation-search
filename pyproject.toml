@@ -1,0 +1,17 @@
+[project]
+name = "conversation-search"
+version = "0.1.0"
+description = "BM25 keyword search over Claude Code conversation history"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["bm25s", "mcp", "uvicorn", "watchdog"]
+
+[project.scripts]
+conversation-search = "conversation_search:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatchling.build]
+include = ["conversation_search.py"]
