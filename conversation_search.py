@@ -25,7 +25,7 @@ from watchdog.observers import Observer
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-_PROJECTS_ROOT = Path.home() / ".claude" / "projects"
+_PROJECTS_ROOT = Path(os.environ["CONVERSATION_SEARCH_PROJECTS_ROOT"]) if os.environ.get("CONVERSATION_SEARCH_PROJECTS_ROOT") else Path.home() / ".claude" / "projects"
 
 mcp_server = FastMCP("conversation-search", instructions="""\
 BM25 keyword search over Claude Code conversation history (JSONL transcripts from ~/.claude/projects/).
@@ -735,7 +735,7 @@ class _DirDiscoveryHandler(FileSystemEventHandler):
 # Daemon helpers
 # ---------------------------------------------------------------------------
 
-_DAEMON_CACHE_DIR = Path.home() / ".cache" / "conversation-search"
+_DAEMON_CACHE_DIR = Path(os.environ["CONVERSATION_SEARCH_CACHE_DIR"]) if os.environ.get("CONVERSATION_SEARCH_CACHE_DIR") else Path.home() / ".cache" / "conversation-search"
 _DEFAULT_PORT = 9237
 _DEFAULT_IDLE_TIMEOUT = 900  # 15 minutes
 
@@ -855,7 +855,7 @@ def _run_daemon(port: int = _DEFAULT_PORT, idle_timeout: float = _DEFAULT_IDLE_T
 
     def idle_watcher() -> None:
         while True:
-            time.sleep(60)
+            time.sleep(min(60, max(1, idle_timeout // 2)))
             if time.monotonic() - last_activity[0] > idle_timeout:
                 print(
                     f"[conversation-search] idle timeout ({idle_timeout}s), shutting down",
