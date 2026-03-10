@@ -1,5 +1,11 @@
 # Plan: Conversation Search MCP Server
 
+> **Migration note (2026-03-10):** The search backend has been migrated from in-memory `bm25s`
+> to SQLite FTS5. The index is now persisted at `~/.cache/conversation-search/index.db`.
+> Query behavior changed from implicit OR to implicit AND. Snippets now use `[[match]]` markers
+> instead of first-300-chars truncation. `bm25s` dependency removed. See `specs/fts5-migration.md`
+> for the full migration spec.
+
 ## Task Description
 Implement a single-file MCP server that indexes Claude Code JSONL conversation transcripts with BM25 and exposes them as searchable tools. The server parses multi-directory conversation files, builds an in-memory BM25 index, watches for filesystem changes, dynamically discovers new project directories, and serves 4 MCP tools for search and retrieval.
 

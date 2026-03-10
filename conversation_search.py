@@ -38,19 +38,20 @@ Workflow — search wide, then read deep:
 3. read_turn: Retrieve one turn in full fidelity (complete user text, assistant text, tools used). Use session_id + turn_number from search results.
 4. read_conversation: Paginated reading of consecutive turns from a session. Use for context around a specific turn.
 
-FTS5 query syntax:
-- Implicit AND: multiple terms must all appear (e.g., "graphiti migration")
-- Phrase search: quoted phrases match exactly (e.g., '"sqlite fts5"')
-- Boolean: OR and NOT operators (e.g., "graphiti OR falkor", "memory NOT cache")
-- Prefix: term* matches any word with that prefix (e.g., "migrat*")
-- Grouping: parentheses for complex queries (e.g., "(graphiti OR falkor) memory")
-- Results are ranked by BM25 score with a recency boost (recent sessions score higher).
-- Snippets show ~24 words of context around the match, with **bold** markers.
+FTS5 query syntax (all terms are implicitly ANDed — all must match):
+- Keywords: `heartbeat timer` — both terms must appear (implicit AND)
+- Phrases: `"systemd timer"` — exact phrase match
+- Boolean: `heartbeat AND NOT clawd`, `timer OR cron`
+- Prefix: `buffer*` — matches bufferStore, bufferMap, etc.
+- Grouping: `(timer OR cron) AND heartbeat`
+- `literal:` prefix: use `literal:foo.bar(x)` to search code-like strings safely (skips FTS5 syntax parsing)
+
+Results are ranked by BM25 relevance with a recency boost (recent conversations score slightly higher).
+Snippets show ~24 words of context around matching terms, with [[match]] markers around highlighted words.
 
 Key details:
 - A "turn" is one user message paired with the full assistant response (text + tool calls).
 - The "project" filter is a substring match against encoded directory names (e.g., "hugoerke" matches "home-gbr-work-001-sites-hugoerke-local").
-- When filtering by session or project, raise the limit since post-retrieval filtering reduces the result count.
 - Timestamps are ISO 8601 UTC.
 """)
 
@@ -408,8 +409,28 @@ def _derive_project_name(dir_name: str, all_dir_names: list[str]) -> str:
 _DAEMON_CACHE_DIR = Path(os.environ["CONVERSATION_SEARCH_CACHE_DIR"]) if os.environ.get("CONVERSATION_SEARCH_CACHE_DIR") else Path.home() / ".cache" / "conversation-search"
 _DB_PATH = _DAEMON_CACHE_DIR / "index.db"
 
+_SCHEMA_VERSION = 1
+
+
+def _check_fts5_available(conn: sqlite3.Connection) -> None:
+    """Verify FTS5 is compiled into this SQLite build.
+
+    Raises RuntimeError with a clear message if FTS5 is unavailable.
+    Called before schema creation in _open_db().
+    """
+    try:
+        conn.execute("CREATE VIRTUAL TABLE _fts5_check USING fts5(x)")
+        conn.execute("DROP TABLE _fts5_check")
+    except sqlite3.OperationalError:
+        raise RuntimeError(
+            "SQLite FTS5 extension not available. "
+            "Python 3.10+ on Linux/macOS should include it. "
+            "Check your Python/SQLite build."
+        )
+
 
 def _create_schema(conn: sqlite3.Connection) -> None:
+    """Create the sessions and turns_fts tables and set user_version."""
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS sessions (
             session_id   TEXT PRIMARY KEY,
@@ -434,7 +455,28 @@ def _create_schema(conn: sqlite3.Connection) -> None:
             tokenize='porter unicode61'
         );
     """)
+    conn.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
     conn.commit()
+
+
+def _path_in_pattern_scope(file_path: str, projects_root: str, pattern: str) -> bool:
+    """Return True if file_path's parent directory is within the current glob pattern's scope.
+
+    A session's file_path is in scope if its immediate parent directory is a direct child
+    of projects_root whose name matches the glob pattern. This check uses fnmatch so it
+    works even if the directory has been deleted (the directory name still matches).
+    """
+    p = Path(file_path)
+    parent = p.parent
+    # The parent must be directly under projects_root (depth = 1)
+    try:
+        rel = parent.relative_to(projects_root)
+    except ValueError:
+        return False
+    # Only consider direct children (no nested subdirs)
+    if len(rel.parts) != 1:
+        return False
+    return fnmatch.fnmatch(parent.name, pattern)
 
 
 def _age_in_days(ts: str, now: float) -> float:
@@ -447,6 +489,15 @@ def _age_in_days(ts: str, now: float) -> float:
         return max(0, (now - dt.timestamp()) / 86400)
     except (ValueError, OSError):
         return 365.0
+
+
+def _extract_search_tokens(query: str) -> list[str]:
+    """Extract FTS-compatible tokens from a query string.
+
+    Strips punctuation/operators that break FTS5 syntax.
+    Keeps alphanumeric characters and underscores only.
+    """
+    return re.findall(r'\w+', query)
 
 
 # ---------------------------------------------------------------------------
@@ -473,6 +524,14 @@ class ConversationIndex:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA cache_size=-8000")
+        _check_fts5_available(conn)
+        # Check schema version — drop and rebuild if mismatched
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        if version != _SCHEMA_VERSION:
+            conn.executescript("""
+                DROP TABLE IF EXISTS sessions;
+                DROP TABLE IF EXISTS turns_fts;
+            """)
         _create_schema(conn)
         return conn
 
@@ -481,24 +540,26 @@ class ConversationIndex:
 
         Uses incremental indexing: checks mtime/size against sessions table.
         Unchanged files are skipped. Changed or new files are fully re-indexed.
-        Sessions for deleted files are removed.
+
+        Stale deletion is pattern-scoped: only sessions whose file_path falls
+        within one of the directories matched by the current glob pattern are
+        candidates for deletion. Sessions from other patterns are never touched.
         """
         directories = _discover_directories(pattern)
         all_dir_names = [d.name for d in directories]
-
-        with self._lock:
-            conn = self._get_connection()
-
-        # Load existing session mtime/size for incremental check
-        existing: dict[str, tuple[float, int]] = {}
-        for row in conn.execute("SELECT file_path, mtime, size FROM sessions"):
-            existing[row[0]] = (row[1], row[2])
 
         seen_paths: set[str] = set()
         file_count = 0
         cache_hits = 0
 
         with self._lock:
+            conn = self._get_connection()
+
+            # Load existing session mtime/size for incremental check
+            existing: dict[str, tuple[float, int]] = {}
+            for row in conn.execute("SELECT file_path, mtime, size FROM sessions"):
+                existing[row[0]] = (row[1], row[2])
+
             for directory in directories:
                 project = _derive_project_name(directory.name, all_dir_names)
                 for jsonl_path in sorted(directory.glob("*.jsonl")):
@@ -567,8 +628,20 @@ class ConversationIndex:
 
             conn.commit()
 
-            # Remove sessions for deleted files
-            stale = [p for p in existing if p not in seen_paths]
+            # Pattern-scoped stale deletion:
+            # Only delete sessions whose file_path falls within the current pattern's
+            # scope AND the file was not seen in this build.
+            # Scope is determined by whether the session's parent directory name matches
+            # the current glob pattern (via fnmatch). This handles both the case where
+            # a file is deleted (parent dir still exists) and where the entire directory
+            # is deleted (parent dir no longer exists but its name matched the pattern).
+            # Sessions from directories outside the current pattern scope are never touched.
+            projects_root_str = str(_PROJECTS_ROOT)
+            stale = [
+                p for p in existing
+                if p not in seen_paths
+                and _path_in_pattern_scope(p, projects_root_str, pattern)
+            ]
             if stale:
                 for path_key in stale:
                     # Look up session_id by file_path to clean turns_fts
@@ -590,6 +663,36 @@ class ConversationIndex:
             file=sys.stderr,
         )
 
+    def _execute_fts_query(
+        self,
+        conn: sqlite3.Connection,
+        sql: str,
+        params: list,
+        original_query: str,
+    ) -> list | dict:
+        """Execute FTS5 query with automatic fallback for syntax errors.
+
+        Tries raw query first. On any sqlite3.OperationalError from the MATCH
+        execution, extracts tokens and retries as a quoted phrase. On second
+        failure, returns a structured error response dict.
+        """
+        try:
+            return conn.execute(sql, params).fetchall()
+        except sqlite3.OperationalError:
+            # Fallback: extract tokens and retry as quoted phrase
+            tokens = _extract_search_tokens(original_query)
+            if not tokens:
+                return {"results": [], "query": original_query, "total": 0,
+                        "error": f"Query failed: empty token list for {original_query!r}"}
+            fallback_query = '"' + " ".join(tokens) + '"'
+            fallback_params = list(params)
+            fallback_params[0] = fallback_query
+            try:
+                return conn.execute(sql, fallback_params).fetchall()
+            except sqlite3.OperationalError as e:
+                return {"results": [], "query": original_query, "total": 0,
+                        "error": f"Query failed: {e}"}
+
     def search(
         self,
         query: str,
@@ -600,44 +703,79 @@ class ConversationIndex:
         """FTS5 full-text search across all conversation turns.
 
         Returns dict with 'results', 'query', 'total'.
+
+        FTS5 query syntax supported:
+        - Keywords: heartbeat timer (implicit AND — all terms must match)
+        - Phrases: "systemd timer" (exact phrase)
+        - Boolean: heartbeat AND NOT clawd, timer OR cron
+        - Prefix: buffer* (prefix matching)
+        - Grouping: (timer OR cron) AND heartbeat
+
+        Prefix queries with 'literal:' tokenize and search as a quoted phrase,
+        bypassing FTS5 syntax parsing for code-like queries.
         """
-        with self._lock:
-            conn = self._get_connection()
+        original_query = query
+
+        # literal: prefix — tokenize and search as quoted phrase
+        if query.startswith("literal:"):
+            raw = query[len("literal:"):]
+            tokens = _extract_search_tokens(raw)
+            query = '"' + " ".join(tokens) + '"' if tokens else raw
 
         now = time.time()
-        fetch_limit = min(limit * 3, 500)
+        # Over-fetch candidates for recency re-ranking, then trim to limit
+        candidate_limit = min(limit * 3, 500)
 
-        sql = """
+        # Build SQL-level filters (not Python post-filter)
+        conditions: list[str] = ["turns_fts MATCH ?"]
+        params: list = [query]
+
+        if session_id:
+            conditions.append("session_id = ?")
+            params.append(session_id)
+        if project:
+            conditions.append("project LIKE ?")
+            params.append(f"%{project}%")
+
+        where = " AND ".join(conditions)
+
+        sql = f"""
             SELECT
-                turns_fts.session_id,
-                turns_fts.turn_number,
-                turns_fts.project,
-                turns_fts.timestamp,
-                snippet(turns_fts, 0, '**', '**', '...', 24) AS snippet,
+                session_id,
+                turn_number,
+                project,
+                timestamp,
+                snippet(turns_fts, 0, '[[', ']]', '...', 24) AS snippet,
                 rank AS bm25_rank
             FROM turns_fts
-            WHERE turns_fts MATCH ?
+            WHERE {where}
             ORDER BY rank
             LIMIT ?
         """
 
-        try:
-            rows = conn.execute(sql, (query, fetch_limit)).fetchall()
-        except sqlite3.OperationalError as exc:
-            # Bad FTS5 query syntax — return empty with error message
-            return {"results": [], "query": query, "total": 0, "error": str(exc)}
+        with self._lock:
+            conn = self._get_connection()
+
+            # Execute with automatic fallback for FTS5 syntax errors
+            result = self._execute_fts_query(conn, sql, params + [candidate_limit], original_query)
+
+            # _execute_fts_query returns a dict on unrecoverable error
+            if isinstance(result, dict):
+                return result
+
+            rows = result
+
+            # Accurate total count: separate COUNT query with same MATCH + filters
+            count_sql = f"SELECT COUNT(*) FROM turns_fts WHERE {where}"
+            try:
+                total = conn.execute(count_sql, params).fetchone()[0]
+            except sqlite3.OperationalError:
+                # If count fails (e.g. fallback query changed), use row count as approximation
+                total = len(rows)
 
         search_results: list[dict] = []
         for row in rows:
-            if len(search_results) >= limit:
-                break
-
             sid, turn_number, proj, ts, snippet_text, bm25_rank = row
-
-            if session_id and sid != session_id:
-                continue
-            if project and project.lower() not in (proj or "").lower():
-                continue
 
             # Recency boost: blend BM25 score with exponential decay
             bm25_score = -bm25_rank  # FTS5 rank is negative; negate for positive score
@@ -654,7 +792,10 @@ class ConversationIndex:
                 "timestamp": ts or "",
             })
 
-        return {"results": search_results, "query": query, "total": len(search_results)}
+        # Re-sort by blended score BEFORE truncating to limit (critical for correct ranking)
+        search_results.sort(key=lambda r: -r["score"])
+
+        return {"results": search_results[:limit], "query": original_query, "total": total}
 
     def list_conversations(
         self,
@@ -664,26 +805,25 @@ class ConversationIndex:
         """List indexed sessions. Returns dict with 'conversations', 'total'."""
         with self._lock:
             conn = self._get_connection()
-
-        if project:
-            rows = conn.execute(
-                """SELECT session_id, project, slug, summary, cwd, git_branch,
-                          first_ts, last_ts, turn_count
-                   FROM sessions
-                   WHERE project LIKE ?
-                   ORDER BY last_ts DESC
-                   LIMIT ?""",
-                (f"%{project}%", limit),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                """SELECT session_id, project, slug, summary, cwd, git_branch,
-                          first_ts, last_ts, turn_count
-                   FROM sessions
-                   ORDER BY last_ts DESC
-                   LIMIT ?""",
-                (limit,),
-            ).fetchall()
+            if project:
+                rows = conn.execute(
+                    """SELECT session_id, project, slug, summary, cwd, git_branch,
+                              first_ts, last_ts, turn_count
+                       FROM sessions
+                       WHERE project LIKE ?
+                       ORDER BY last_ts DESC
+                       LIMIT ?""",
+                    (f"%{project}%", limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """SELECT session_id, project, slug, summary, cwd, git_branch,
+                              first_ts, last_ts, turn_count
+                       FROM sessions
+                       ORDER BY last_ts DESC
+                       LIMIT ?""",
+                    (limit,),
+                ).fetchall()
 
         conv_list = [
             {
@@ -706,10 +846,9 @@ class ConversationIndex:
         """Full-fidelity read of a single turn."""
         with self._lock:
             conn = self._get_connection()
-
-        row = conn.execute(
-            "SELECT file_path FROM sessions WHERE session_id = ?", (session_id,)
-        ).fetchone()
+            row = conn.execute(
+                "SELECT file_path FROM sessions WHERE session_id = ?", (session_id,)
+            ).fetchone()
         if row is None:
             return {"error": f"Unknown session_id: {session_id}"}
 
@@ -738,12 +877,11 @@ class ConversationIndex:
         """Paginated reading of turns from a session."""
         with self._lock:
             conn = self._get_connection()
-
-        row = conn.execute(
-            """SELECT file_path, project, cwd, git_branch
-               FROM sessions WHERE session_id = ?""",
-            (session_id,),
-        ).fetchone()
+            row = conn.execute(
+                """SELECT file_path, project, cwd, git_branch
+                   FROM sessions WHERE session_id = ?""",
+                (session_id,),
+            ).fetchone()
         if row is None:
             return {"error": f"Unknown session_id: {session_id}"}
 
@@ -1033,8 +1171,14 @@ def _run_daemon(port: int = _DEFAULT_PORT, idle_timeout: float = _DEFAULT_IDLE_T
     ) -> str:
         """FTS5 full-text search across all conversation turns.
 
+        Multiple terms are implicitly ANDed — all must appear in a matching turn.
+        Use OR explicitly for either-or matching (e.g., "timer OR cron").
+        Supports phrases ("exact phrase"), prefix (term*), boolean (AND/OR/NOT),
+        and grouping ((a OR b) AND c). Use the literal: prefix for code-like queries
+        that contain special characters (e.g., literal:foo.bar()).
+
         Args:
-            query: Search query string.
+            query: FTS5 search query. Implicit AND between terms. Use OR/NOT for boolean.
             limit: Maximum number of results to return.
             session_id: Optional filter to restrict results to a specific session.
             project: Optional filter to restrict results to a specific project (substring match).
@@ -1202,8 +1346,14 @@ def _register_tools(server: FastMCP, index: ConversationIndex) -> None:
     ) -> str:
         """FTS5 full-text search across all conversation turns.
 
+        Multiple terms are implicitly ANDed — all must appear in a matching turn.
+        Use OR explicitly for either-or matching (e.g., "timer OR cron").
+        Supports phrases ("exact phrase"), prefix (term*), boolean (AND/OR/NOT),
+        and grouping ((a OR b) AND c). Use the literal: prefix for code-like queries
+        that contain special characters (e.g., literal:foo.bar()).
+
         Args:
-            query: Search query string.
+            query: FTS5 search query. Implicit AND between terms. Use OR/NOT for boolean.
             limit: Maximum number of results to return.
             session_id: Optional filter to restrict results to a specific session.
             project: Optional filter to restrict results to a specific project (substring match).

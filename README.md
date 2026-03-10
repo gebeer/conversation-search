@@ -1,6 +1,6 @@
 # conversation-search
 
-BM25 keyword search over Claude Code conversation history. Indexes JSONL transcripts from `~/.claude/projects/` and exposes them as searchable memory. Available as both an MCP server and a CLI tool.
+FTS5 full-text search over Claude Code conversation history. Indexes JSONL transcripts from `~/.claude/projects/` into a persistent SQLite FTS5 database and exposes them as searchable memory. Available as both an MCP server and a CLI tool.
 
 Based on [Searchable Agent Memory in a Single File](https://eric-tramel.github.io/blog/2026-02-07-searchable-agent-memory/) by Eric Tramel.
 
@@ -18,16 +18,17 @@ Claude Code stores conversation transcripts as JSONL files under `~/.claude/proj
 
 1. Discovers matching project directories via glob pattern
 2. Parses JSONL into turns (user message + assistant response + tool calls)
-3. Builds a BM25 index over the corpus
-4. Watches the filesystem for changes and reindexes (60s debounce)
-5. Serves 4 MCP tools via stdio (`serve`) or SSE (`daemon`)
+3. Builds an SQLite FTS5 index stored at `~/.cache/conversation-search/index.db`
+4. On warm start, only reparses files whose mtime/size has changed (sub-second startup)
+5. Watches the filesystem for changes and reindexes (60s debounce)
+6. Serves 4 MCP tools via stdio (`serve`) or SSE (`daemon`)
 
 ## Requirements
 
 - Python >= 3.10
 - [`uv`](https://docs.astral.sh/uv/) (dependencies are managed via PEP 723 inline metadata)
 
-No venv or manual install needed. `uv run` handles `bm25s`, `mcp`, `uvicorn`, and `watchdog` automatically.
+No venv or manual install needed. `uv run` handles `mcp`, `uvicorn`, and `watchdog` automatically. No `bm25s` or other search library is required — SQLite FTS5 is part of the Python standard library.
 
 ## Configuration
 
@@ -77,7 +78,7 @@ All CLI commands output pretty-printed JSON to stdout. Index progress is printed
 ## Daemon Mode (Recommended for Multiple Sessions)
 
 When running multiple Claude Code sessions simultaneously, use daemon mode to share a single
-BM25 index instead of building one per session.
+SQLite FTS5 index instead of opening separate DB connections per session.
 
 ### Setup
 
@@ -125,28 +126,40 @@ Both flags work on `daemon` and `connect` subcommands.
 Claude Code session A ──┐
 Claude Code session B ──┼── connect (stdio↔SSE bridge) ──► daemon (SSE on localhost:9237)
 Claude Code session C ──┘                                       │
-                                                          • one BM25 index (~250 MB)
+                                                          • one FTS5 index (~10 MB)
                                                           • one inotify watcher set
                                                           • one reindex loop
 ```
 
-**Without daemon:** N sessions × ~250 MB RAM, N reindex cycles per file change.
-**With daemon:** 1 × ~250 MB regardless of session count.
+**Without daemon:** N sessions each open the same SQLite DB (WAL mode handles concurrent reads).
+**With daemon:** Single writer/watcher; all sessions share one connection via SSE.
 
 ## Tools
 
 ### `search_conversations`
 
-BM25 keyword search across all indexed turns.
+FTS5 full-text search across all indexed turns. All terms are implicitly ANDed.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `query` | `str` | required | Search query (specific keywords work best) |
+| `query` | `str` | required | FTS5 search query. All terms must match (implicit AND). |
 | `limit` | `int` | `10` | Max results |
 | `session_id` | `str \| None` | `None` | Filter to one session |
 | `project` | `str \| None` | `None` | Substring filter on project name |
 
-Returns ranked results with `session_id`, `turn_number`, `score`, `snippet` (300 chars), `timestamp`.
+Returns ranked results with `session_id`, `turn_number`, `score`, `snippet` (context window with `[[match]]` markers), `timestamp`.
+
+#### Query syntax
+
+| Syntax | Example | Meaning |
+|--------|---------|---------|
+| Keywords | `heartbeat timer` | Both must match (implicit AND) |
+| Phrase | `"systemd timer"` | Exact phrase |
+| Boolean | `heartbeat AND NOT clawd` | Boolean operators |
+| Prefix | `buffer*` | Prefix matching |
+| OR | `heartbeat OR cron` | Either term |
+| Grouping | `(timer OR cron) AND heartbeat` | Grouped boolean |
+| Literal | `literal:foo.bar()` | Code-like query, skips FTS5 syntax parsing |
 
 ### `list_conversations`
 
@@ -192,4 +205,4 @@ read_turn(session_id, turn_number)                   ->  get full context
 read_conversation(session_id, offset, limit)         ->  read surrounding turns
 ```
 
-BM25 works best with specific keywords. Vague queries return noise. Post-retrieval filtering (by session/project) happens after BM25 scoring, so increase `limit` when filtering.
+FTS5 requires all query terms to match (implicit AND). Use specific keywords for best results. For either-or matching, use explicit `OR`. For code-like queries with special characters, use the `literal:` prefix.
